@@ -101,6 +101,7 @@ def write_index_html() -> None:
         f'<td><a href="aqi/{s}/manifest.json">manifest.json</a></td></tr>'
         for s in SETS
     )
+    setup_link = '<p><a href="td_setup.py">td_setup.py</a> — paste into TouchDesigner Textport (Alt-T) to build the ingestion network inside <code>/project1/aqi_animation</code>.</p>'
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -126,12 +127,22 @@ def write_index_html() -> None:
 {body_rows}
     </tbody>
   </table>
+  {setup_link}
   <p style="margin-top:24px">Source: <a href="https://github.com/diagram-chasing/metro-aqi-exhibition">diagram-chasing/metro-aqi-exhibition</a></p>
 </body>
 </html>
 """
     (OUT_ROOT.parent / "index.html").write_text(html)
     print(f"  index    → {OUT_ROOT.parent / 'index.html'}")
+
+
+def copy_td_setup() -> None:
+    src = Path("td_setup.py")
+    if not src.exists():
+        return
+    dest = OUT_ROOT.parent / "td_setup.py"
+    dest.write_bytes(src.read_bytes())
+    print(f"  td_setup → {dest}")
 
 
 def main() -> None:
@@ -142,6 +153,7 @@ def main() -> None:
     for name in SETS:
         build_one(name)
     write_index_html()
+    copy_td_setup()
     print("\nDone.")
 
 

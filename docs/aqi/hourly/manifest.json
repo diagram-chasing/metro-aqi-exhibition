@@ -25,5 +25,5 @@
   ],
   "pixel_mapping": "value = (gray/255) * (vmax - vmin) + vmin; alpha=0 outside polygon",
   "frame_at": "row = hour // cols, col = hour % cols",
-  "generated_at": "2026-05-25T15:08:47Z"
+  "generated_at": "2026-05-25T15:31:16+00:00"
 }
