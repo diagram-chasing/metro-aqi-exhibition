@@ -7,27 +7,25 @@ Flow:
   2. Filter to GBA bounding box
   3. Fetch last-24h readings per station
   4. Average readings by hour-of-day (0–23) per station
-  5. Spatially interpolate to a 0.01° grid for each hour
+  5. Spatially interpolate to a 0.01° storage grid with a Gaussian-IDW kernel
   6. Save: NetCDF, gridded CSV, hourly-average CSV
-  7. Generate 24 PNG heatmaps — one version with numbers, one without
+  7. Generate PNGs:
+       • with_labels / without_labels — matplotlib reference views
+       • td/                          — raw greyscale frames sized to the
+                                        higher-resolution render grid for
+                                        TouchDesigner ingestion
 
-Interpolation:
-  scipy.interpolate.griddata with method="linear" is used when ≥ 3 station
-  points are available for an hour; otherwise falls back to "nearest".
+Interpolation
+-------------
+Each grid cell is a weighted average of all station readings with weights
 
-  Linear interpolation works in two stages:
-    (a) Delaunay triangulation — the station locations are triangulated so
-        the city is tiled by non-overlapping triangles.
-    (b) Barycentric interpolation — for each 0.01° grid point P inside a
-        triangle with vertices A, B, C, the PM2.5 value is the area-weighted
-        average of the three station values:
+    w_s(cell) = exp(−distance(cell, s)² / (2·σ²))     (Gaussian, σ in km)
+    value(cell) = Σ_s w_s · pm25_s / Σ_s w_s
 
-          PM2.5(P) = λ_A·v_A + λ_B·v_B + λ_C·v_C
-          where λ_i = area of sub-triangle opposite vertex i / area(ABC)
-          and λ_A + λ_B + λ_C = 1
-
-  Grid points outside the convex hull of stations (no enclosing triangle)
-  are filled with the nearest-neighbour value to avoid edge NaNs.
+mirroring the kernel structure used in metro.py (so both visualisations have
+the same "smooth bumps" aesthetic). Distances are computed in UTM zone 43N
+(EPSG:32643). σ = HOURLY_SIGMA_KM defaults to 2 km, slightly broader than
+the metro decay so sparse station coverage doesn't show triangle facets.
 """
 
 import time
@@ -44,6 +42,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
+import pyproj
+
+import td_export
 
 warnings.filterwarnings('ignore')
 
@@ -63,22 +64,32 @@ def _url(path: str) -> str:
 
 
 # ── GBA bounding box + 0.01° padding ─────────────────────────────────────
-#   S 12.8334905  N 13.1426196  W 77.4598797  E 77.7840639
 LAT_MIN, LAT_MAX = 12.8235, 13.1526
 LON_MIN, LON_MAX = 77.4499, 77.7941
 
-# Fine grid for interpolated heatmap (~55×55 points)
+# Storage grid (NetCDF/CSV) — kept at 0.01° for backward compatibility
 FINE_LAT = np.arange(LAT_MIN, LAT_MAX + 0.005, 0.01)
 FINE_LON = np.arange(LON_MIN, LON_MAX + 0.005, 0.01)
+
+# Render grid (PNG / TD frames) — finer so smoothness is visible
+RENDER_STEP_DEG = 0.002
+RENDER_LAT = np.arange(LAT_MIN, LAT_MAX + RENDER_STEP_DEG / 2, RENDER_STEP_DEG)
+RENDER_LON = np.arange(LON_MIN, LON_MAX + RENDER_STEP_DEG / 2, RENDER_STEP_DEG)
 
 # Coarser grid for text labels (one label per ~5 km cell)
 COARSE_LAT = np.arange(LAT_MIN + 0.025, LAT_MAX, 0.05)
 COARSE_LON = np.arange(LON_MIN + 0.025, LON_MAX, 0.05)
 
+# Gaussian IDW kernel width (km). 2 km gives a soft, continuously varying field
+# over ~20–30 sparse stations without obvious facets.
+HOURLY_SIGMA_KM = 2.0
+
 OUT     = Path("./")
 OUT_RAW = OUT / "raw/hourly"
 OUT_NC  = OUT / "nc/hourly"
 OUT_PNG = OUT / "png/hourly"
+
+_UTM = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:32643", always_xy=True)
 
 
 # ── Data fetching ──────────────────────────────────────────────────────────
@@ -162,47 +173,75 @@ def collect_all_readings(
     return hour_pts, pd.DataFrame(raw_rows)
 
 
-# ── Interpolation ──────────────────────────────────────────────────────────
+# ── Interpolation: Gaussian IDW ────────────────────────────────────────────
 
-def _interp_hour(
+def _gaussian_idw(
     pts: List[Tuple[float, float, float]],
-    grid_lat_2d: np.ndarray,
-    grid_lon_2d: np.ndarray,
+    grid_lat: np.ndarray,
+    grid_lon: np.ndarray,
+    sigma_km: float,
 ) -> np.ndarray:
-    """Interpolate sparse station points onto a 2-D grid."""
+    """
+    Smoothly interpolate sparse station points onto a regular lat/lon grid.
+
+    weight_s(cell) = exp(−d(cell, s)² / (2·σ²))     # d in km
+    value(cell)    = Σ_s w_s · v_s / Σ_s w_s
+
+    Returns a (len(grid_lat), len(grid_lon)) float32 array; NaN only if every
+    station weight underflows (i.e. all stations astronomically far away).
+    """
+    n_lat, n_lon = len(grid_lat), len(grid_lon)
     if not pts:
-        return np.full(grid_lat_2d.shape, np.nan)
+        return np.full((n_lat, n_lon), np.nan, dtype=np.float32)
 
     src_lat, src_lon, vals = zip(*pts)
-    src = np.column_stack([src_lat, src_lon])
-    dst = np.column_stack([grid_lat_2d.ravel(), grid_lon_2d.ravel()])
+    st_e, st_n = _UTM.transform(list(src_lon), list(src_lat))
+    st_e = np.asarray(st_e)
+    st_n = np.asarray(st_n)
+    vals = np.asarray(vals, dtype=np.float64)
 
-    method = "nearest" if len(pts) < 3 else "linear"
-    result = griddata(src, vals, dst, method=method).reshape(grid_lat_2d.shape)
+    two_sigma_sq_m2 = 2.0 * (sigma_km * 1000.0) ** 2
 
-    if method == "linear" and np.any(np.isnan(result)):
-        nearest = griddata(src, vals, dst, method="nearest").reshape(grid_lat_2d.shape)
-        result = np.where(np.isnan(result), nearest, result)
+    out = np.empty((n_lat, n_lon), dtype=np.float32)
+    for i, lat in enumerate(grid_lat):
+        cell_e, cell_n = _UTM.transform(grid_lon, np.full(n_lon, lat))
+        cell_e = np.asarray(cell_e)
+        cell_n = np.asarray(cell_n)
+        d_sq = (cell_e[:, None] - st_e[None, :]) ** 2 + (cell_n[:, None] - st_n[None, :]) ** 2
+        w = np.exp(-d_sq / two_sigma_sq_m2)
+        w_sum = w.sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out[i] = np.where(w_sum > 0, (w @ vals) / w_sum, np.nan).astype(np.float32)
+    return out
 
-    return result.astype(np.float32)
 
-
-def build_dataset(hour_pts: Dict[int, list]) -> xr.Dataset:
-    """Build xr.Dataset with PM25(hour, lat, lon)."""
-    glon, glat = np.meshgrid(FINE_LON, FINE_LAT)
-    cube = np.stack([_interp_hour(hour_pts[h], glat, glon) for h in range(24)])
+def build_storage_dataset(hour_pts: Dict[int, list]) -> xr.Dataset:
+    """xr.Dataset with PM25(hour, lat, lon) on the coarse 0.01° storage grid."""
+    cube = np.stack([
+        _gaussian_idw(hour_pts[h], FINE_LAT, FINE_LON, HOURLY_SIGMA_KM)
+        for h in range(24)
+    ])
     return xr.Dataset(
         {"PM25": (["hour", "lat", "lon"], cube)},
         coords={"hour": np.arange(24), "lat": FINE_LAT, "lon": FINE_LON},
         attrs={
-            "title": "BLR Hourly Average PM2.5",
+            "title": "BLR Hourly Average PM2.5 (Gaussian IDW, σ=%.1fkm)" % HOURLY_SIGMA_KM,
             "source": "oaq.notf.in (airnet, aurassure, cpcb)",
             "generated_at": datetime.now().isoformat(),
             "lat_units": "degrees_north",
             "lon_units": "degrees_east",
             "pm25_units": "ug/m3",
+            "sigma_km": HOURLY_SIGMA_KM,
         },
     )
+
+
+def build_render_cube(hour_pts: Dict[int, list]) -> np.ndarray:
+    """High-resolution cube used for PNG output."""
+    return np.stack([
+        _gaussian_idw(hour_pts[h], RENDER_LAT, RENDER_LON, HOURLY_SIGMA_KM)
+        for h in range(24)
+    ])
 
 
 # ── Output helpers ─────────────────────────────────────────────────────────
@@ -218,14 +257,14 @@ def save_outputs(ds: xr.Dataset) -> None:
     print(f"  Gridded CSV  → {csv_path}")
 
 
-def generate_pngs(ds: xr.Dataset) -> None:
-    cube = ds["PM25"].values  # (24, lat, lon)
-    vmin = float(np.nanpercentile(cube, 2))
-    vmax = float(np.nanpercentile(cube, 98))
-    if vmin >= vmax:
-        vmin, vmax = 0.0, max(float(np.nanmax(cube)), 1.0)
+def generate_pngs(render_cube: np.ndarray) -> None:
+    boundary_mask = (
+        td_export.rasterize_polygon(td_export.TD_BOUNDARY_GEOJSON, RENDER_LAT, RENDER_LON)
+        if td_export.TD_BOUNDARY_GEOJSON else None
+    )
+    vmin, vmax = td_export.cube_percentile_range(render_cube, mask=boundary_mask)
 
-    glon, glat = np.meshgrid(FINE_LON, FINE_LAT)
+    rglon, rglat = np.meshgrid(RENDER_LON, RENDER_LAT)
     cglon, cglat = np.meshgrid(COARSE_LON, COARSE_LAT)
 
     for with_labels in (False, True):
@@ -234,23 +273,22 @@ def generate_pngs(ds: xr.Dataset) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for hour in range(24):
+            pm25 = render_cube[hour]
             fig, ax = plt.subplots(figsize=(8, 8), dpi=150)
-            pm25 = cube[hour]
-
             im = ax.imshow(
                 pm25,
-                cmap="gray",          # pixel brightness ≡ PM2.5 level
+                cmap="gray",
                 vmin=vmin,
                 vmax=vmax,
                 origin="lower",
                 extent=[LON_MIN, LON_MAX, LAT_MIN, LAT_MAX],
                 aspect="auto",
-                interpolation="nearest",
+                interpolation="bilinear",
             )
 
             if with_labels:
                 label_vals = griddata(
-                    np.column_stack([glat.ravel(), glon.ravel()]),
+                    np.column_stack([rglat.ravel(), rglon.ravel()]),
                     pm25.ravel(),
                     np.column_stack([cglat.ravel(), cglon.ravel()]),
                     method="nearest",
@@ -280,14 +318,27 @@ def generate_pngs(ds: xr.Dataset) -> None:
             )
             plt.close()
 
-        print(f"  24 PNGs ({tag:<12}) → {out_dir}/")
+        print(f"  24 PNGs ({tag:<14}) → {out_dir}/")
+
+    td_export.write_sequence(
+        (render_cube[h] for h in range(24)),
+        OUT_PNG / "td",
+        vmin=vmin,
+        vmax=vmax,
+        unit="ug_per_m3",
+        target_long_edge=td_export.TD_LONG_EDGE,
+        lats=RENDER_LAT,
+        lons=RENDER_LON,
+        mask=boundary_mask,
+    )
+    print(f"  24 PNGs ({'td':<14}) → {OUT_PNG / 'td'}/  ({td_export.TD_LONG_EDGE}px long edge, source {render_cube.shape[2]}×{render_cube.shape[1]})")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
     print("=" * 60)
-    print("BLR Hourly PM2.5  |  oaq.notf.in")
+    print("BLR Hourly PM2.5  |  oaq.notf.in  |  Gaussian IDW σ=%.1f km" % HOURLY_SIGMA_KM)
     print("=" * 60)
     for d in (OUT, OUT_RAW, OUT_NC, OUT_PNG):
         d.mkdir(parents=True, exist_ok=True)
@@ -308,14 +359,15 @@ def main() -> None:
         print("No readings returned from any station. Exiting.")
         return
 
-    print("\n[3/5] Interpolating to 0.01° grid…")
-    ds = build_dataset(hour_pts)
+    print("\n[3/5] Interpolating to 0.01° storage grid (Gaussian IDW)…")
+    ds = build_storage_dataset(hour_pts)
 
     print("\n[4/5] Saving NetCDF + CSVs…")
     save_outputs(ds)
 
-    print("\n[5/5] Generating PNGs…")
-    generate_pngs(ds)
+    print(f"\n[5/5] Rendering at 0.002° ({len(RENDER_LAT)}×{len(RENDER_LON)}) + writing PNGs…")
+    render_cube = build_render_cube(hour_pts)
+    generate_pngs(render_cube)
 
     print(f"\nDone. All outputs in: {OUT.resolve()}")
 

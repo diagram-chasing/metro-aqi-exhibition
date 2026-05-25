@@ -26,45 +26,71 @@ NetPM25[cell, hour] = ObsPM25[cell, hour] / (1 − ReductionFraction[cell])
 
 ### Reduction fraction
 
-`ReductionFraction` is a static spatial map built from station ridership. Each station contributes an exponentially decaying influence weighted by its peak ridership:
+`ReductionFraction` is an hourly `(hour, lat, lon)` cube built from station ridership. For each hour `h`, every station contributes an exponentially decaying influence weighted by its average ridership at that hour:
 
 ```
-score[cell] = Σ_s  ridership_s × exp(−distance(cell, s) / DECAY_KM)
+score[hour, cell] = Σ_s  ridership_{s,hour} × exp(−distance(cell, s) / DECAY_KM)
 ```
 
-The raw score is then normalised and floored so two calibration targets are met simultaneously:
+The raw cube is then normalised once across all 24 hours and floored so two calibration targets are met simultaneously:
 
 | Target | Value | Basis |
 |---|---|---|
-| Peak `ReductionFraction` | 25% | Midpoint of 20–30% near-corridor reduction |
-| City-wide mean `ReductionFraction` | 5% | ~4% AOD reduction in high-pollution cities |
+| Global peak `ReductionFraction` | 25% | Midpoint of 20–30% near-corridor reduction |
+| Cube-wide mean `ReductionFraction` | 5% | ~4% AOD reduction in high-pollution cities |
 
 ```
-ReductionFraction[cell] = clip(score_normalised[cell] + baseline, 0, 0.25)
+ReductionFraction[hour, cell] = clip(score_normalised[hour, cell] + baseline, 0, 0.25)
 ```
+
+Calibration is global (not per-hour) so the animation reads as ridership ebbing and flowing through the day rather than every frame being independently rescaled.
 
 | Parameter | Value | Role |
 |---|---|---|
 | `DECAY_KM` | 1.5 km | e-folding distance of each station's spatial influence |
-| Peak normalisation | score / max(score) × 0.25 | Anchors highest-ridership cell to 25% |
-| `baseline` | solved (~2–3%) | Uniform floor added so city mean = 5% |
+| Peak normalisation | score / max_over_cube(score) × 0.25 | Anchors highest-ridership cell+hour to 25% |
+| `baseline` | solved | Uniform floor added so cube-wide mean = 5% |
 
-Ridership is peak hourly entries + exits per station from the BMRCL parquet files. High ridership stations drive stronger local reductions; low ridership stations contribute proportionally less.
+Ridership is hourly entries + exits per station from the BMRCL parquet files, averaged across all observed days to get one `(station, hour)` matrix. Mornings and evenings produce stronger, wider reductions; late-night hours fade close to the baseline.
+
+### Hourly observed PM2.5
+
+`PM25(hour, lat, lon)` is built from sparse ground-station readings (airnet, aurassure, cpcb) using a **Gaussian-IDW kernel** (σ ≈ 2 km, distances in UTM zone 43N):
+
+```
+weight_s(cell) = exp(−distance(cell, s)² / (2·σ²))
+value(cell)    = Σ_s w_s · pm25_s / Σ_s w_s
+```
+
+This replaces an earlier Delaunay/barycentric pipeline that left visible triangle facets and convex-hull artefacts, and gives the hourly map the same smooth-bumps look as the metro reduction map.
 
 ## Pipeline
 
 | Script | Role |
 |---|---|
-| `hourly.py` | Fetches 24-hour PM2.5 readings from monitoring stations and interpolates to a 0.01° grid → `nc/hourly/gridded.nc` |
-| `metro.py` | Builds the ridership-weighted `ReductionFraction` map → `nc/avoided/avoided_gridded.nc` |
+| `hourly.py` | Fetches 24-hour PM2.5 readings from monitoring stations and interpolates to a 0.01° grid via Gaussian IDW → `nc/hourly/gridded.nc` |
+| `metro.py` | Builds the hourly ridership-weighted `ReductionFraction` cube → `nc/avoided/avoided_gridded.nc` |
 | `main.py` | Adds back avoided emissions to observed PM2.5 to estimate PM2.5 without metro; saves NetCDF + CSVs + 24 hourly PNGs |
 
 ### Quick start
 
 ```bash
-python hourly.py         # regenerate hourly PM2.5 grid
-python metro.py          # regenerate reduction fraction map
-python main.py           # compute net PM2.5 and render PNGs
+uv sync                  # install dependencies from pyproject.toml
+uv run python hourly.py  # regenerate hourly PM2.5 grid
+uv run python metro.py   # regenerate hourly reduction fraction cube
+uv run python main.py    # compute net PM2.5 and render PNGs
 ```
 
 Outputs are saved in `nc/`, `raw/`, and `png/`.
+
+### PNG outputs
+
+Each of the three datasets writes three PNG variants:
+
+| Folder | Contents | Purpose |
+|---|---|---|
+| `png/<set>/with_labels/` | 24 hourly matplotlib heatmaps with title/axes/colourbar/labels | Documentation, sanity checks |
+| `png/<set>/without_labels/` | Same as above, no per-cell number overlays | Documentation, sanity checks |
+| `png/<set>/td/` | Raw greyscale PNGs sized to the data grid; latitude flipped to image-Y; `range.json` sidecar records `vmin`, `vmax`, unit | TouchDesigner ingestion (no chrome to strip) |
+
+All three datasets now have 24 frames (`00.png … 23.png`); `avoided` is no longer a single static frame.

@@ -4,11 +4,15 @@ main.py — Net PM2.5: what observed PM2.5 would be if metro users drove instead
 
 Flow:
   1. (Optional) Refetch hourly PM2.5 via hourly.py pipeline
-  2. Load hourly PM2.5 grid from nc/gridded.nc              — PM25(hour, lat, lon)
-  3. Load reduction fraction grid from nc/avoided/avoided_gridded.nc — ReductionFraction(lat, lon)
-  4. Scale: NetPM25[h] = PM25[h] / (1 - ReductionFraction)
-  5. Save: net_nc/net_gridded.nc, net_raw/net_gridded.csv
-  6. Generate 24 PNG heatmaps in net_png/
+  2. Load hourly PM2.5 grid from nc/hourly/gridded.nc       — PM25(hour, lat, lon)
+  3. Load reduction fraction cube from nc/avoided/avoided_gridded.nc
+                                                            — ReductionFraction(hour, lat, lon)
+  4. Combine:   NetPM25[h] = PM25[h] / (1 - ReductionFraction[h])
+  5. Save: nc/net/net_gridded.nc, raw/net/net_gridded.csv
+  6. Generate PNGs:
+       • with_labels / without_labels — matplotlib reference views
+       • td/                          — raw greyscale frames sized to the
+                                        higher-resolution render grid
 """
 
 import argparse
@@ -22,6 +26,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
+
+import hourly as hourly_mod
+import td_export
 
 warnings.filterwarnings('ignore')
 
@@ -40,19 +47,16 @@ COARSE_LON = np.arange(LON_MIN + 0.025, LON_MAX, 0.05)
 
 
 def refetch_hourly() -> None:
-    import hourly
-    import time
-
     print("\n[refetch] Fetching station list…")
-    stations = hourly.fetch_stations()
+    stations = hourly_mod.fetch_stations()
     if not stations:
         raise RuntimeError("No stations found — aborting refetch.")
 
     print(f"\n[refetch] Fetching last-24h time-series for {len(stations)} stations…")
-    hour_pts, raw_df = hourly.collect_all_readings(stations)
+    hour_pts, raw_df = hourly_mod.collect_all_readings(stations)
 
-    hourly.OUT_RAW.mkdir(parents=True, exist_ok=True)
-    raw_csv = hourly.OUT_RAW / "hourly.csv"
+    hourly_mod.OUT_RAW.mkdir(parents=True, exist_ok=True)
+    raw_csv = hourly_mod.OUT_RAW / "hourly.csv"
     raw_df.to_csv(raw_csv, index=False)
     print(f"  Raw readings → {raw_csv}  ({len(raw_df)} rows)")
 
@@ -60,10 +64,10 @@ def refetch_hourly() -> None:
         raise RuntimeError("No readings returned — aborting refetch.")
 
     print("\n[refetch] Interpolating to 0.01° grid…")
-    ds = hourly.build_dataset(hour_pts)
+    ds = hourly_mod.build_storage_dataset(hour_pts)
 
-    hourly.OUT_NC.mkdir(parents=True, exist_ok=True)
-    hourly.save_outputs(ds)
+    hourly_mod.OUT_NC.mkdir(parents=True, exist_ok=True)
+    hourly_mod.save_outputs(ds)
     print("[refetch] Done.\n")
 
 
@@ -83,7 +87,9 @@ def load_inputs() -> tuple[xr.DataArray, xr.DataArray]:
 
 
 def build_net_dataset(pm25: xr.DataArray, fraction: xr.DataArray) -> xr.Dataset:
-    net = pm25 / (1.0 - fraction)  # broadcasts over hour dimension
+    """NetPM25 = ObsPM25 / (1 − ReductionFraction). Broadcasts hour-to-hour
+    when fraction has a 'hour' dim, or static if 2D."""
+    net = pm25 / (1.0 - fraction)
     return xr.Dataset(
         {"NetPM25": net},
         attrs={
@@ -108,17 +114,39 @@ def save_outputs(ds: xr.Dataset) -> None:
     print(f"  Gridded CSV  → {csv_path}")
 
 
+def _resample_to_render_grid(cube: np.ndarray, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Bilinear resample a (hour, lat, lon) cube to the hourly render grid."""
+    rlat = hourly_mod.RENDER_LAT
+    rlon = hourly_mod.RENDER_LON
+
+    da = xr.DataArray(
+        cube,
+        coords={"hour": np.arange(cube.shape[0]), "lat": lats, "lon": lons},
+        dims=["hour", "lat", "lon"],
+    )
+    resampled = da.interp(lat=rlat, lon=rlon, method="linear")
+    # Edge cells beyond the source grid corners can be NaN; fall back to nearest.
+    if bool(resampled.isnull().any()):
+        nearest = da.interp(lat=rlat, lon=rlon, method="nearest")
+        resampled = resampled.fillna(nearest)
+    return resampled.to_numpy()
+
+
 def generate_pngs(ds: xr.Dataset) -> None:
-    cube = ds["NetPM25"].values  # (24, lat, lon)
+    cube = ds["NetPM25"].values  # (24, lat, lon) on storage grid
     lats = ds["lat"].values
     lons = ds["lon"].values
 
-    vmin = float(np.nanpercentile(cube, 2))
-    vmax = float(np.nanpercentile(cube, 98))
-    if vmin >= vmax:
-        vmin, vmax = 0.0, max(float(np.nanmax(cube)), 1.0)
+    render_cube = _resample_to_render_grid(cube, lats, lons)
+    boundary_mask = (
+        td_export.rasterize_polygon(
+            td_export.TD_BOUNDARY_GEOJSON,
+            hourly_mod.RENDER_LAT, hourly_mod.RENDER_LON,
+        ) if td_export.TD_BOUNDARY_GEOJSON else None
+    )
+    vmin, vmax = td_export.cube_percentile_range(render_cube, mask=boundary_mask)
 
-    glon, glat = np.meshgrid(lons, lats)
+    rglon, rglat = np.meshgrid(hourly_mod.RENDER_LON, hourly_mod.RENDER_LAT)
     cglon, cglat = np.meshgrid(COARSE_LON, COARSE_LAT)
 
     for with_labels in (False, True):
@@ -127,9 +155,8 @@ def generate_pngs(ds: xr.Dataset) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for hour in range(24):
+            net = render_cube[hour]
             fig, ax = plt.subplots(figsize=(8, 8), dpi=150)
-            net = cube[hour]
-
             im = ax.imshow(
                 net,
                 cmap="gray",
@@ -138,12 +165,12 @@ def generate_pngs(ds: xr.Dataset) -> None:
                 origin="lower",
                 extent=[LON_MIN, LON_MAX, LAT_MIN, LAT_MAX],
                 aspect="auto",
-                interpolation="nearest",
+                interpolation="bilinear",
             )
 
             if with_labels:
                 label_vals = griddata(
-                    np.column_stack([glat.ravel(), glon.ravel()]),
+                    np.column_stack([rglat.ravel(), rglon.ravel()]),
                     net.ravel(),
                     np.column_stack([cglat.ravel(), cglon.ravel()]),
                     method="nearest",
@@ -173,7 +200,20 @@ def generate_pngs(ds: xr.Dataset) -> None:
             )
             plt.close()
 
-        print(f"  24 PNGs ({tag:<12}) → {out_dir}/")
+        print(f"  24 PNGs ({tag:<14}) → {out_dir}/")
+
+    td_export.write_sequence(
+        (render_cube[h] for h in range(24)),
+        OUT_PNG / "td",
+        vmin=vmin,
+        vmax=vmax,
+        unit="ug_per_m3",
+        target_long_edge=td_export.TD_LONG_EDGE,
+        lats=hourly_mod.RENDER_LAT,
+        lons=hourly_mod.RENDER_LON,
+        mask=boundary_mask,
+    )
+    print(f"  24 PNGs ({'td':<14}) → {OUT_PNG / 'td'}/  ({td_export.TD_LONG_EDGE}px long edge, source {render_cube.shape[2]}×{render_cube.shape[1]})")
 
 
 def main() -> None:
@@ -200,7 +240,7 @@ def main() -> None:
     print("\n[1/3] Loading hourly PM2.5 and metro reduction fraction…")
     pm25, fraction = load_inputs()
     print(f"  Hourly shape:   {pm25.shape}  (hour × lat × lon)")
-    print(f"  Fraction shape: {fraction.shape}  (lat × lon)")
+    print(f"  Fraction shape: {fraction.shape}  ({'hour × ' if fraction.ndim == 3 else ''}lat × lon)")
     print(f"  Fraction range: {float(fraction.min()):.3f} – {float(fraction.max()):.3f}")
 
     print("\n[2/3] Computing net PM2.5 and saving…")

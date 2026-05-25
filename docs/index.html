@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BLR Metro AQI — TD assets</title>
+  <style>
+    body { font: 14px/1.5 ui-monospace, monospace; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #222; }
+    h1   { font-size: 18px; margin-bottom: 4px; }
+    p    { color: #555; }
+    table{ border-collapse: collapse; width: 100%; margin-top: 12px; }
+    td, th { padding: 8px 10px; border-bottom: 1px solid #eee; text-align: left; }
+    th   { font-weight: 600; color: #666; }
+    a    { color: #0a52d6; }
+    code { background: #f6f6f6; padding: 1px 5px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>BLR Metro AQI — TouchDesigner assets</h1>
+  <p>24-hour PM2.5 animations clipped to the Bengaluru boundary. Each strip is a 6×4 grid (row = hour ÷ 6, col = hour mod 6). Pull <code>strip.png</code> once with <code>Movie File In TOP</code>, fetch <code>manifest.json</code> with <code>Web Client DAT</code> for <code>vmin/vmax</code> and grid layout.</p>
+  <table>
+    <thead><tr><th>set</th><th>strip</th><th>manifest</th></tr></thead>
+    <tbody>
+      <tr><td><code>hourly</code></td><td><a href="aqi/hourly/strip.png">strip.png</a></td><td><a href="aqi/hourly/manifest.json">manifest.json</a></td></tr>
+      <tr><td><code>avoided</code></td><td><a href="aqi/avoided/strip.png">strip.png</a></td><td><a href="aqi/avoided/manifest.json">manifest.json</a></td></tr>
+      <tr><td><code>net</code></td><td><a href="aqi/net/strip.png">strip.png</a></td><td><a href="aqi/net/manifest.json">manifest.json</a></td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:24px">Source: <a href="https://github.com/diagram-chasing/metro-aqi-exhibition">diagram-chasing/metro-aqi-exhibition</a></p>
+</body>
+</html>

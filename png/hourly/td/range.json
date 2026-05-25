@@ -1,0 +1,22 @@
+{
+  "vmin": 8.897595405578613,
+  "vmax": 44.48604202270508,
+  "unit": "ug_per_m3",
+  "frame_count": 24,
+  "source_grid_wh": [
+    173,
+    166
+  ],
+  "target_long_edge": 1024,
+  "resample": "Lanczos",
+  "masked": true,
+  "mask_extent": {
+    "lat_min": 12.835500000000003,
+    "lat_max": 13.141500000000105,
+    "lon_min": 77.46189999999997,
+    "lon_max": 77.78389999999922
+  },
+  "pixel_mapping": "0 \u2192 vmin, 255 \u2192 vmax (linear); alpha=0 outside mask",
+  "axis_order": "image: row=lat (top=north), col=lon (left=west)",
+  "note": "arrays were flipped along latitude before save"
+}

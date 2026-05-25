@@ -1,0 +1,29 @@
+{
+  "name": "avoided",
+  "frame_count": 24,
+  "grid": {
+    "cols": 6,
+    "rows": 4
+  },
+  "frame_w": 1024,
+  "frame_h": 973,
+  "strip_w": 6144,
+  "strip_h": 3892,
+  "mode": "LA",
+  "vmin": 0.0,
+  "vmax": 0.25,
+  "unit": "reduction_fraction",
+  "mask_extent": {
+    "lat_min": 12.835500000000003,
+    "lat_max": 13.141500000000105,
+    "lon_min": 77.46189999999997,
+    "lon_max": 77.78389999999922
+  },
+  "source_grid_wh": [
+    173,
+    166
+  ],
+  "pixel_mapping": "value = (gray/255) * (vmax - vmin) + vmin; alpha=0 outside polygon",
+  "frame_at": "row = hour // cols, col = hour % cols",
+  "generated_at": "2026-05-25T15:08:48Z"
+}
